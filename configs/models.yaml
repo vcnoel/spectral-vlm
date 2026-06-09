@@ -1,0 +1,28 @@
+primary:
+  model_id: "google/gemma-4-E4B-it"
+  dtype: "bfloat16"
+  attn_implementation: "eager"
+  # image_token_index: set automatically from model config
+  # expected_visual_tokens: set automatically from model config
+  device_map: "cuda"
+
+cross_arch_a:
+  model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+  dtype: "bfloat16"
+  attn_implementation: "eager"
+  # Variable visual length — fixed via min/max pixels
+  min_pixels: 256  # 16*16
+  max_pixels: 1024  # 32*32
+  device_map: "cuda"
+
+cross_arch_b:
+  model_id: "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+  dtype: "bfloat16"
+  attn_implementation: "eager"
+  device_map: "cuda"
+
+generation:
+  do_sample: false
+  max_new_tokens: 256
+  # Analyze attention at first generated token (token index 0 of generated sequence)
+  analyze_token_offset: 0

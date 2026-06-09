@@ -1,0 +1,38 @@
+# GSP metric configuration — fed into spectral_trust.GSPConfig
+gsp:
+  head_aggregation: "uniform"      # mean-across-heads aggregation
+  symmetrization: "symmetric"      # W = (A + A^T) / 2
+  normalization: "sym"             # symmetric normalized Laplacian
+  hfer_cutoff_ratio: 0.25          # top-25% of spectrum = high-frequency
+  num_eigenvalues: 50
+  eigen_solver: "dense"            # dense is safer for seq_len ~256-512
+  save_intermediate: false
+
+# Views to compute per (layer, head-agg)
+views:
+  - name: "vv"      # visual→visual block (square, n_v × n_v)
+    square: true
+  - name: "tv"      # text→visual block → co-attention A_tv @ A_tv.T (square, n_t × n_t)
+    square: false   # rectangular slice; symmetrized via co-attention
+  - name: "full"    # entire sequence (square, n × n)
+    square: true
+
+# Head aggregations
+aggregations:
+  - "mean"          # aggregate_heads(uniform) then compute metrics
+  - "max"           # per-head metrics, take max
+
+# Phase 0 dataset settings
+phase0:
+  figstep:
+    n_samples: 280
+    split: "train"
+  mmsafetybench:
+    subset: "SD_TYPO"
+    n_samples: 280
+
+# Statistical analysis
+stats:
+  bootstrap_resamples: 10000
+  fdr_alpha: 0.05
+  random_seed: 42
