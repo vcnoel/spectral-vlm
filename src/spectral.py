@@ -1,10 +1,10 @@
 """
-Spectral analysis of VLM attention using spectral_trust.
+GPU-native spectral analysis of VLM attention.
 
-Graph construction  : spectral_trust.GraphConstructor  — runs on CUDA tensors.
-Eigendecomposition  : spectral_trust.SpectralAnalyzer  — Lanczos via ARPACK
-                      (eigen_solver="sparse", k=50 eigenvalues).
-Only the final eigen step moves to CPU/numpy; everything upstream stays on GPU.
+Graph construction  : spectral_trust.GraphConstructor  — CUDA tensors throughout.
+Eigendecomposition  : torch.linalg.eigh                — CUDA LAPACK, full spectrum.
+All metric arithmetic stays on GPU; only float scalars hit the CPU at the end.
+scipy / numpy are never called in the hot path.
 
 Output shape per example: [n_layers, n_metrics=4, n_views=3, n_aggs=2]
 Metric order : [fiedler, entropy, smoothness, hfer]
@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
-from spectral_trust import GSPConfig, GraphConstructor, SpectralAnalyzer, SpectralDiagnostics
+from spectral_trust import GSPConfig, GraphConstructor
 from .extract import ForwardResult
 
 logger = logging.getLogger(__name__)
@@ -29,80 +29,96 @@ METRIC_NAMES = ["fiedler", "entropy", "smoothness", "hfer"]
 VIEW_NAMES   = ["vv", "tv", "full"]
 AGG_NAMES    = ["mean", "max"]
 
+_HFER_CUTOFF = 0.25   # top-25 % of spectrum = high-frequency
 
-def _make_gsp_cfg(hfer_cutoff: float = 0.25) -> GSPConfig:
+
+def _make_gsp_cfg() -> GSPConfig:
     return GSPConfig(
         head_aggregation="uniform",
         symmetrization="symmetric",
         normalization="sym",
-        hfer_cutoff_ratio=hfer_cutoff,
-        eigen_solver="sparse",      # Lanczos via ARPACK
-        num_eigenvalues=50,
+        hfer_cutoff_ratio=_HFER_CUTOFF,
         save_intermediate=False,
         verbose=False,
     )
 
 
-def _diag_to_vec(d: SpectralDiagnostics) -> np.ndarray:
-    return np.array([d.fiedler_value, d.spectral_entropy,
-                     d.smoothness_index, d.hfer], dtype=np.float32)
+# ---------------------------------------------------------------------------
+# GPU metric kernel — no numpy, no scipy
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _metrics_from_adj(adj: torch.Tensor, graph: GraphConstructor) -> np.ndarray:
+    """
+    adj : [n, n] symmetrised adjacency, float32, on CUDA.
+    Returns float32 ndarray [4] = [fiedler, entropy, smoothness, hfer].
+    Everything runs on GPU; only 4 scalars are transferred to CPU at the end.
+    """
+    n = adj.shape[0]
+    if n < 3:
+        return np.zeros(4, dtype=np.float32)
+
+    # Symmetric normalised Laplacian — stays on GPU.
+    lap = graph.construct_laplacian(adj.unsqueeze(0)).squeeze(0)  # [n, n]
+
+    # ── Attention-mass signal: degree vector, mean-centred ───────────────
+    degree = adj.sum(dim=-1)                        # [n]
+    signal = (degree - degree.mean()).unsqueeze(1)  # [n, 1]
+    xTx    = (signal * signal).sum().clamp(min=1e-8)
+
+    # ── Smoothness: x^T L x / x^T x  (pure matmul, no eigen needed) ─────
+    smoothness = ((signal.T @ lap @ signal).squeeze() / xTx).item()
+
+    # ── Full spectrum on GPU — CUDA LAPACK divide-and-conquer ────────────
+    eigenvalues, eigenvectors = torch.linalg.eigh(lap)   # ascending, [n] / [n,n]
+    eigenvalues = eigenvalues.clamp(min=0.0)
+
+    # Fiedler: λ₂
+    fiedler = eigenvalues[1].item() if n > 1 else 0.0
+
+    # Spectral entropy: p_i = λ_i / Σλ  (skip trivial zero eigenvalue)
+    ev      = eigenvalues[1:]
+    ev_sum  = ev.sum().clamp(min=1e-8)
+    p       = (ev / ev_sum).clamp(min=1e-12)
+    entropy = -(p * p.log()).sum().item()
+
+    # HFER: fraction of signal energy in top-25 % high-freq eigenvectors
+    cutoff   = int((1.0 - _HFER_CUTOFF) * n)
+    sig_hat  = eigenvectors.T @ signal               # [n, 1]
+    energies = sig_hat.squeeze().pow(2)              # [n]
+    total    = energies.sum().clamp(min=1e-8)
+    hfer     = (energies[cutoff:].sum() / total).clamp(0.0, 1.0).item()
+
+    return np.array([fiedler, entropy, smoothness, hfer], dtype=np.float32)
 
 
-def _attention_mass_signal(adj: torch.Tensor) -> torch.Tensor:
-    """Row-sum of adjacency, mean-centred → [n, 1] float32 on same device."""
-    mass = adj.sum(dim=-1, keepdim=True).float()
-    return mass - mass.mean()
-
-
-def _analyze_adj(
-    adj: torch.Tensor,              # [n, n] symmetrised, float32, on device
-    graph: GraphConstructor,
-    analyzer: SpectralAnalyzer,
-    layer_idx: int,
-) -> np.ndarray:
-    """Build Laplacian on GPU, compute signal on GPU, run Lanczos on CPU."""
-    lap = graph.construct_laplacian(adj.unsqueeze(0))   # [1, n, n], stays on device
-    sig = _attention_mass_signal(adj)                   # [n, 1], stays on device
-    # analyze_layer accepts torch tensors — handles .cpu().numpy() internally.
-    d = analyzer.analyze_layer(sig, lap, layer_idx)
-    return _diag_to_vec(d)
-
+# ---------------------------------------------------------------------------
+# View helpers
+# ---------------------------------------------------------------------------
 
 def _square_views(
     A_heads: torch.Tensor,          # [H, n, n] on device
     graph: GraphConstructor,
-    analyzer: SpectralAnalyzer,
-    layer_idx: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Returns (mean_metrics[4], max_metrics[4]) for a square view."""
-    A_f = A_heads.float()
-    A_sym = 0.5 * (A_f + A_f.transpose(-2, -1))        # [H, n, n]
+    """mean-agg and max-agg metrics for a square view."""
+    A_sym = 0.5 * (A_heads + A_heads.transpose(-2, -1))   # [H, n, n]
 
-    # mean: uniform aggregate across heads
-    adj_mean = A_sym.mean(dim=0)                        # [n, n]
-    mean_m = _analyze_adj(adj_mean, graph, analyzer, layer_idx)
+    # mean across heads
+    mean_m = _metrics_from_adj(A_sym.mean(dim=0), graph)
 
-    # max: per-head metrics, element-wise max
-    head_m = np.stack([
-        _analyze_adj(A_sym[h], graph, analyzer, layer_idx)
-        for h in range(A_sym.shape[0])
-    ])
-    max_m = head_m.max(axis=0)
-
-    return mean_m, max_m
+    # per-head → element-wise max
+    head_m = np.stack([_metrics_from_adj(A_sym[h], graph) for h in range(A_sym.shape[0])])
+    return mean_m, head_m.max(axis=0)
 
 
 def _tv_views(
-    A_tv_heads: torch.Tensor,       # [H, n_t, n_v] on device
+    A_tv: torch.Tensor,             # [H, n_t, n_v] on device
     graph: GraphConstructor,
-    analyzer: SpectralAnalyzer,
-    layer_idx: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Co-attention A_tv @ A_tv^T → [H, n_t, n_t], then square pipeline."""
-    A_f = A_tv_heads.float()
-    co  = torch.bmm(A_f, A_f.transpose(1, 2))          # [H, n_t, n_t]
+    co  = torch.bmm(A_tv, A_tv.transpose(1, 2))            # [H, n_t, n_t]
     co  = co / co.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    return _square_views(co, graph, analyzer, layer_idx)
+    return _square_views(co, graph)
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +126,8 @@ def _tv_views(
 # ---------------------------------------------------------------------------
 
 class LayerSpectralMetrics:
-    """4 metrics × 3 views × 2 aggs for one layer → shape [4, 3, 2]."""
-
     def __init__(self, data: np.ndarray):
-        assert data.shape == (4, 3, 2), data.shape
+        assert data.shape == (4, 3, 2)
         self.data = data
 
     def get(self, metric: str, view: str, agg: str) -> float:
@@ -139,18 +153,13 @@ def compute_spectral_trajectory(
     gsp_cfg: Optional[GSPConfig] = None,
     device: Optional[torch.device] = None,
 ) -> List[LayerSpectralMetrics]:
-    """
-    One LayerSpectralMetrics per transformer layer.
-    Graph construction is GPU-resident; Lanczos eigen runs on CPU via spectral-trust.
-    """
+    """One LayerSpectralMetrics per transformer layer. Fully GPU-resident."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if gsp_cfg is None:
         gsp_cfg = _make_gsp_cfg()
 
-    graph    = GraphConstructor(gsp_cfg)
-    analyzer = SpectralAnalyzer(gsp_cfg)
-
+    graph   = GraphConstructor(gsp_cfg)
     v_start = result.visual_start
     v_end   = result.visual_end
     seq_len = result.seq_len
@@ -159,37 +168,30 @@ def compute_spectral_trajectory(
     trajectory: List[LayerSpectralMetrics] = []
 
     for layer_idx, A_cpu in enumerate(result.attentions):
-        # Move this layer's attention to GPU once.
-        A = A_cpu.to(device, dtype=torch.float32)       # [H, seq, seq]
+        A    = A_cpu.to(device, dtype=torch.float32)    # [H, seq, seq] → GPU
         data = np.zeros((4, 3, 2), dtype=np.float32)
 
-        # A_vv — visual → visual
         try:
             data[:, 0, 0], data[:, 0, 1] = _square_views(
-                A[:, v_start:v_end, v_start:v_end], graph, analyzer, layer_idx)
+                A[:, v_start:v_end, v_start:v_end], graph)
         except Exception as e:
             logger.debug("Layer %d vv: %s", layer_idx, e)
 
-        # A_tv — text → visual co-attention
         try:
             if t_idx:
                 t_tensor = torch.tensor(t_idx, device=device)
-                A_tv = A.index_select(1, t_tensor)[:, :, v_start:v_end]
                 data[:, 1, 0], data[:, 1, 1] = _tv_views(
-                    A_tv, graph, analyzer, layer_idx)
+                    A.index_select(1, t_tensor)[:, :, v_start:v_end], graph)
         except Exception as e:
             logger.debug("Layer %d tv: %s", layer_idx, e)
 
-        # A_full — entire sequence
         try:
-            data[:, 2, 0], data[:, 2, 1] = _square_views(
-                A, graph, analyzer, layer_idx)
+            data[:, 2, 0], data[:, 2, 1] = _square_views(A, graph)
         except Exception as e:
             logger.debug("Layer %d full: %s", layer_idx, e)
 
         trajectory.append(LayerSpectralMetrics(data))
         del A
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     return trajectory
